@@ -26,32 +26,6 @@ import jinja2
 from loguru import logger
 
 
-# Auto-trigger marimo's "Toggle app view" once the editor mounts. The action
-# is registered against `global.hideCode` (cmd+. / ctrl+.). Wait for the
-# shortcut handler to register before firing, then dispatch the keydown.
-APP_VIEW_SNIPPET = """
-<script>
-(function () {
-  const dispatch = () => {
-    document.dispatchEvent(new KeyboardEvent('keydown', {
-      key: '.', code: 'Period',
-      metaKey: true, ctrlKey: true,
-      bubbles: true, cancelable: true,
-    }));
-  };
-  const ready = () => !!document.querySelector('marimo-app') ||
-    !!document.querySelector('[data-testid="cell"]');
-  let tries = 0;
-  const timer = setInterval(() => {
-    tries += 1;
-    if (ready()) { clearInterval(timer); setTimeout(dispatch, 400); }
-    else if (tries > 60) { clearInterval(timer); }
-  }, 250);
-})();
-</script>
-"""
-
-
 def _run_export(notebook_path: Path, output_file: Path, mode: str, show_code: Optional[bool] = None) -> bool:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     cmd: List[str] = [
@@ -69,24 +43,13 @@ def _run_export(notebook_path: Path, output_file: Path, mode: str, show_code: Op
         return False
 
 
-def _inject_app_view(html_path: Path) -> None:
-    text = html_path.read_text()
-    if "</body>" in text and "marimo-app-view-trigger" not in text:
-        marker = "<!-- marimo-app-view-trigger -->"
-        html_path.write_text(text.replace("</body>", marker + APP_VIEW_SNIPPET + "</body>"))
-
-
 def _export_html_wasm(notebook_path: Path, output_dir: Path, as_app: bool = False) -> bool:
     output_file = output_dir / notebook_path.with_suffix(".html")
     if as_app:
         logger.info(f"Exporting {notebook_path} → {output_file} (app, run mode, code hidden)")
-        ok = _run_export(notebook_path, output_file, mode="run", show_code=False)
-    else:
-        logger.info(f"Exporting {notebook_path} → {output_file} (notebook, edit mode + app-view auto-toggle)")
-        ok = _run_export(notebook_path, output_file, mode="edit")
-        if ok:
-            _inject_app_view(output_file)
-    return ok
+        return _run_export(notebook_path, output_file, mode="run", show_code=False)
+    logger.info(f"Exporting {notebook_path} → {output_file} (notebook, edit mode)")
+    return _run_export(notebook_path, output_file, mode="edit")
 
 
 def _copy_companion_files(folder: Path, output_dir: Path) -> None:
