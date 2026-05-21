@@ -30,8 +30,8 @@ def _export_html_wasm(notebook_path: Path, output_dir: Path, as_app: bool = Fals
 
     cmd: List[str] = ["uvx", "marimo", "export", "html-wasm", "--sandbox"]
     if as_app:
-        logger.info(f"Exporting {notebook_path} → {output_file} (app, run mode)")
-        cmd.extend(["--mode", "run", "--no-show-code"])
+        logger.info(f"Exporting {notebook_path} → {output_file} (app, run mode, code toggle)")
+        cmd.extend(["--mode", "run"])
     else:
         logger.info(f"Exporting {notebook_path} → {output_file} (notebook, edit mode)")
         cmd.extend(["--mode", "edit"])
