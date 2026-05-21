@@ -45,6 +45,23 @@ def _export_html_wasm(notebook_path: Path, output_dir: Path, as_app: bool = Fals
         return False
 
 
+def _copy_companion_files(folder: Path, output_dir: Path) -> None:
+    """Mirror non-.py files (CSS, layouts/, public/, JSON, images) so marimo's
+    css_file / layout_file references resolve in the exported HTML."""
+    skip_dirs = {"__pycache__", ".ipynb_checkpoints"}
+    skip_exts = {".py"}
+    for src in folder.rglob("*"):
+        if src.is_dir() or any(part in skip_dirs for part in src.parts):
+            continue
+        if src.suffix in skip_exts:
+            continue
+        rel = src.relative_to(folder)
+        dst = output_dir / folder.name / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        logger.info(f"Copied companion {src} → {dst}")
+
+
 def _export_folder(folder: Path, output_dir: Path, as_app: bool = False) -> List[dict]:
     if not folder.exists():
         logger.warning(f"Skipping missing folder: {folder}")
@@ -55,7 +72,7 @@ def _export_folder(folder: Path, output_dir: Path, as_app: bool = False) -> List
         logger.warning(f"No .py files in {folder}")
         return []
 
-    return [
+    exported = [
         {
             "display_name": nb.stem.replace("_", " ").title(),
             "html_path": str(nb.with_suffix(".html")),
@@ -63,6 +80,9 @@ def _export_folder(folder: Path, output_dir: Path, as_app: bool = False) -> List
         for nb in notebooks
         if _export_html_wasm(nb, output_dir, as_app=as_app)
     ]
+
+    _copy_companion_files(folder, output_dir)
+    return exported
 
 
 def _generate_index(output_dir: Path, template_file: Path, notebooks: list, apps: list) -> None:
