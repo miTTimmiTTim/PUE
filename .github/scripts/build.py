@@ -8,42 +8,51 @@
 # ///
 """
 Export marimo notebooks under notebooks/ (edit mode) and apps/ (run mode)
-to WASM HTML, drop a .nojekyll marker, and render a Jinja index page.
+to WASM HTML, mirror companion files (css, layouts, public/), inject a
+post-load script that switches to app view, and render a Jinja index.
 
 Run: uv run .github/scripts/build.py
 Output: _site/
 """
 
 import re
-import subprocess
 import shutil
-import tempfile
+import subprocess
 from pathlib import Path
 from typing import List, Optional, Union
 
-import jinja2
 import fire
+import jinja2
 from loguru import logger
 
 
-_LAYOUT_RE = re.compile(r'^\s*layout_file\s*=.*,?\s*\n', re.MULTILINE)
+# Auto-trigger marimo's "Toggle app view" once the editor mounts. The action
+# is registered against `global.hideCode` (cmd+. / ctrl+.). Wait for the
+# shortcut handler to register before firing, then dispatch the keydown.
+APP_VIEW_SNIPPET = """
+<script>
+(function () {
+  const dispatch = () => {
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: '.', code: 'Period',
+      metaKey: true, ctrlKey: true,
+      bubbles: true, cancelable: true,
+    }));
+  };
+  const ready = () => !!document.querySelector('marimo-app') ||
+    !!document.querySelector('[data-testid="cell"]');
+  let tries = 0;
+  const timer = setInterval(() => {
+    tries += 1;
+    if (ready()) { clearInterval(timer); setTimeout(dispatch, 400); }
+    else if (tries > 60) { clearInterval(timer); }
+  }, 250);
+})();
+</script>
+"""
 
 
-def _has_slides_layout(notebook_path: Path) -> bool:
-    text = notebook_path.read_text()
-    return bool(_LAYOUT_RE.search(text)) and "slides" in text
-
-
-def _strip_layout(source: str) -> str:
-    return _LAYOUT_RE.sub("", source)
-
-
-def _run_export(
-    notebook_path: Path,
-    output_file: Path,
-    mode: str,
-    show_code: Optional[bool] = None,
-) -> bool:
+def _run_export(notebook_path: Path, output_file: Path, mode: str, show_code: Optional[bool] = None) -> bool:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     cmd: List[str] = [
         "uvx", "marimo", "export", "html-wasm", "--sandbox",
@@ -52,7 +61,6 @@ def _run_export(
     if show_code is False:
         cmd.append("--no-show-code")
     cmd.extend([str(notebook_path), "-o", str(output_file)])
-    logger.debug(f"Running: {' '.join(cmd)}")
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True)
         return True
@@ -61,80 +69,51 @@ def _run_export(
         return False
 
 
-def _export_html_wasm(notebook_path: Path, output_dir: Path, as_app: bool = False) -> bool:
-    """Export a notebook. If it declares a slides layout_file, also emit a
-    `-scroll.html` companion with the layout stripped so students can switch."""
-    output_file = output_dir / notebook_path.with_suffix(".html")
+def _inject_app_view(html_path: Path) -> None:
+    text = html_path.read_text()
+    if "</body>" in text and "marimo-app-view-trigger" not in text:
+        marker = "<!-- marimo-app-view-trigger -->"
+        html_path.write_text(text.replace("</body>", marker + APP_VIEW_SNIPPET + "</body>"))
 
+
+def _export_html_wasm(notebook_path: Path, output_dir: Path, as_app: bool = False) -> bool:
+    output_file = output_dir / notebook_path.with_suffix(".html")
     if as_app:
-        logger.info(f"Exporting {notebook_path} → {output_file} (app, run, code hidden)")
+        logger.info(f"Exporting {notebook_path} → {output_file} (app, run mode, code hidden)")
         ok = _run_export(notebook_path, output_file, mode="run", show_code=False)
     else:
-        logger.info(f"Exporting {notebook_path} → {output_file} (notebook, edit)")
+        logger.info(f"Exporting {notebook_path} → {output_file} (notebook, edit mode + app-view auto-toggle)")
         ok = _run_export(notebook_path, output_file, mode="edit")
-
-    if not ok:
-        return False
-
-    if _has_slides_layout(notebook_path):
-        scroll_name = notebook_path.with_name(notebook_path.stem + "-scroll.py")
-        scroll_out = output_dir / scroll_name.with_suffix(".html").relative_to(notebook_path.parent.parent) \
-            if False else output_dir / notebook_path.parent.name / (notebook_path.stem + "-scroll.html")
-        scroll_out.parent.mkdir(parents=True, exist_ok=True)
-
-        stripped = _strip_layout(notebook_path.read_text())
-        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, dir=notebook_path.parent) as tf:
-            tf.write(stripped)
-            tmp_path = Path(tf.name)
-        try:
-            logger.info(f"Exporting scroll variant → {scroll_out}")
-            _run_export(tmp_path, scroll_out, mode="edit")
-        finally:
-            tmp_path.unlink(missing_ok=True)
-
-    return True
+        if ok:
+            _inject_app_view(output_file)
+    return ok
 
 
 def _copy_companion_files(folder: Path, output_dir: Path) -> None:
-    """Mirror non-.py files (CSS, layouts/, public/, JSON, images) so marimo's
-    css_file / layout_file references resolve in the exported HTML."""
     skip_dirs = {"__pycache__", ".ipynb_checkpoints"}
-    skip_exts = {".py"}
     for src in folder.rglob("*"):
-        if src.is_dir() or any(part in skip_dirs for part in src.parts):
+        if src.is_dir() or any(p in skip_dirs for p in src.parts) or src.suffix == ".py":
             continue
-        if src.suffix in skip_exts:
-            continue
-        rel = src.relative_to(folder)
-        dst = output_dir / folder.name / rel
+        dst = output_dir / folder.name / src.relative_to(folder)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
-        logger.info(f"Copied companion {src} → {dst}")
 
 
 def _export_folder(folder: Path, output_dir: Path, as_app: bool = False) -> List[dict]:
     if not folder.exists():
-        logger.warning(f"Skipping missing folder: {folder}")
         return []
-
     notebooks = sorted(folder.rglob("*.py"))
     if not notebooks:
         logger.warning(f"No .py files in {folder}")
         return []
-
-    exported = []
-    for nb in notebooks:
-        if not _export_html_wasm(nb, output_dir, as_app=as_app):
-            continue
-        display = nb.stem.replace("_", " ").replace("-", " ").title()
-        entry = {
-            "display_name": display,
+    exported = [
+        {
+            "display_name": nb.stem.replace("_", " ").replace("-", " ").title(),
             "html_path": str(nb.with_suffix(".html")),
         }
-        if (output_dir / nb.parent.name / (nb.stem + "-scroll.html")).exists():
-            entry["scroll_path"] = str(nb.parent / (nb.stem + "-scroll.html"))
-        exported.append(entry)
-
+        for nb in notebooks
+        if _export_html_wasm(nb, output_dir, as_app=as_app)
+    ]
     _copy_companion_files(folder, output_dir)
     return exported
 
@@ -146,7 +125,6 @@ def _generate_index(output_dir: Path, template_file: Path, notebooks: list, apps
     )
     template = env.get_template(template_file.name)
     (output_dir / "index.html").write_text(template.render(notebooks=notebooks, apps=apps))
-    logger.info(f"Wrote {output_dir / 'index.html'}")
 
 
 def main(
@@ -155,7 +133,6 @@ def main(
 ) -> None:
     output_dir = Path(output_dir)
     template_file = Path(template)
-
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -168,10 +145,7 @@ def main(
         return
 
     _generate_index(output_dir, template_file, notebooks_data, apps_data)
-
     (output_dir / ".nojekyll").touch()
-    logger.info("Created .nojekyll")
-
     logger.info(f"Done. Serve locally with: python -m http.server -d {output_dir}")
 
 

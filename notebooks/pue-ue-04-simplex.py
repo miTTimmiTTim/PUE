@@ -14,8 +14,6 @@ __generated_with = "0.18.3"
 app = marimo.App(
     width="full",
     app_title="PuE Übung 4: Simplex-Algorithmus",
-    layout_file="layouts/pue-ue-04-simplex.slides.json",
-    css_file="custom.css",
 )
 
 
