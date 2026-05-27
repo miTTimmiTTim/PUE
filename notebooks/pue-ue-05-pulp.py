@@ -4,6 +4,8 @@
 #     "marimo",
 #     "pulp",
 #     "pandas",
+#     "scipy",
+#     "numpy",
 # ]
 # ///
 
@@ -26,30 +28,150 @@ def imports():
 
 @app.cell(hide_code=True)
 def helpers(mo, pl):
-    import tempfile
+    import numpy as np
+    from scipy.optimize import linprog
 
-    def _solve_with_log(prob):
-        """Löst `prob` und gibt (raised_exception_or_None, cbc_log_text) zurück."""
-        with tempfile.NamedTemporaryFile(suffix=".log", delete=False, mode="w") as fh:
-            log_path = fh.name
+    def solve_prob(prob):
+        """Löst ein PuLP-Problem mittels scipy.optimize.linprog (HiGHS).
+
+        Funktioniert in jeder Umgebung — auch im Browser (Pyodide/WASM),
+        wo der CBC-Subprocess nicht verfügbar ist. Schreibt `.varValue`,
+        `.slack`, `.pi` und `prob.status` so zurück, dass alles wie bei
+        einem CBC-Solve aussieht (`pl.value(...)`, `c.slack`, `c.pi`).
+
+        Returns (error_or_None, log_text).
+        """
         try:
-            prob.solve(pl.PULP_CBC_CMD(msg=0, logPath=log_path))
-            err = None
+            variables = prob.variables()
+            n = len(variables)
+            idx = {v.name: i for i, v in enumerate(variables)}
+
+            # ── Zielfunktion: scipy minimiert → bei Max negieren ──
+            c = np.zeros(n)
+            if prob.objective is not None:
+                for v, coef in prob.objective.items():
+                    c[idx[v.name]] = coef
+            is_max = (prob.sense == pl.LpMaximize)
+            if is_max:
+                c = -c
+
+            # ── Bounds ──
+            bounds = [(v.lowBound, v.upBound) for v in variables]
+
+            # ── Constraints in scipy-Standardform: A_ub x ≤ b_ub, A_eq x = b_eq ──
+            A_ub_rows, b_ub_vals = [], []
+            A_eq_rows, b_eq_vals = [], []
+            con_map = {}  # name → (kind, row_idx, sign_for_pi)
+
+            for name, con in prob.constraints.items():
+                row = np.zeros(n)
+                for v, coef in con.items():
+                    row[idx[v.name]] = coef
+                rhs = -con.constant
+                if con.sense == pl.LpConstraintLE:
+                    A_ub_rows.append(row); b_ub_vals.append(rhs)
+                    con_map[name] = ("ub", len(A_ub_rows) - 1, +1)
+                elif con.sense == pl.LpConstraintGE:
+                    A_ub_rows.append(-row); b_ub_vals.append(-rhs)
+                    con_map[name] = ("ub", len(A_ub_rows) - 1, -1)
+                else:  # EQ
+                    A_eq_rows.append(row); b_eq_vals.append(rhs)
+                    con_map[name] = ("eq", len(A_eq_rows) - 1, +1)
+
+            A_ub = np.array(A_ub_rows) if A_ub_rows else None
+            b_ub = np.array(b_ub_vals) if b_ub_vals else None
+            A_eq = np.array(A_eq_rows) if A_eq_rows else None
+            b_eq = np.array(b_eq_vals) if b_eq_vals else None
+
+            result = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                             bounds=bounds, method="highs")
+
+            # ── PuLP-Status setzen ──
+            if result.success:
+                prob.status = 1  # Optimal
+            elif result.status == 2:
+                prob.status = -1  # Infeasible
+            elif result.status == 3:
+                prob.status = -2  # Unbounded
+            else:
+                prob.status = 0  # Not solved
+
+            # ── Variablenwerte ──
+            if result.success:
+                for i, v in enumerate(variables):
+                    v.varValue = float(result.x[i])
+
+            # ── Slack & Schattenpreise (Dual-Werte zurückmappen) ──
+            ineq_marg = (list(result.ineqlin.marginals)
+                         if (result.success and getattr(result, "ineqlin", None) is not None)
+                         else [])
+            eq_marg = (list(result.eqlin.marginals)
+                       if (result.success and getattr(result, "eqlin", None) is not None)
+                       else [])
+            obj_sign = -1.0 if is_max else 1.0  # ∂max_obj/∂rhs = −∂min_obj/∂rhs
+
+            for name, con in prob.constraints.items():
+                if result.success:
+                    lhs = sum(coef * (v.varValue or 0) for v, coef in con.items())
+                    rhs = -con.constant
+                    if con.sense == pl.LpConstraintLE:
+                        con.slack = rhs - lhs
+                    elif con.sense == pl.LpConstraintGE:
+                        con.slack = lhs - rhs
+                    else:
+                        con.slack = rhs - lhs
+                kind, ridx, sign = con_map[name]
+                if kind == "ub" and ridx < len(ineq_marg):
+                    con.pi = obj_sign * sign * ineq_marg[ridx]
+                elif kind == "eq" and ridx < len(eq_marg):
+                    con.pi = obj_sign * eq_marg[ridx]
+
+            # ── Log ──
+            status_name = {1: "Optimal", -1: "Infeasible",
+                           -2: "Unbounded", 0: "Not Solved"}.get(prob.status, "Unknown")
+            log = "\n".join([
+                "scipy.optimize.linprog · method='highs'",
+                f"Status:      {status_name}",
+                f"Iterations:  {getattr(result, 'nit', '—')}",
+                f"Objective:   {pl.value(prob.objective):.6f}"
+                if result.success and prob.objective is not None else "Objective:   —",
+                f"Solver msg:  {getattr(result, 'message', '')}",
+            ])
+            return None, log
         except Exception as exc:
-            err = exc
-        try:
-            with open(log_path) as fh:
-                log_text = fh.read()
-        except OSError:
-            log_text = "(kein CBC-Log verfügbar)"
-        return err, log_text
+            return exc, f"scipy-Bridge fehlgeschlagen: {type(exc).__name__}: {exc}"
 
     def _solver_log_panel(log_text):
         return mo.accordion({
-            "🔬 CBC-Solver-Output anzeigen": mo.md(
+            "🔬 Solver-Output anzeigen": mo.md(
                 f"```\n{log_text.strip() or '(leer)'}\n```"
             )
         })
+
+    # ── PuLP-Default-Solver auf scipy umstellen ──
+    # Damit funktioniert `prob.solve()` direkt — auch im Browser (Pyodide/WASM),
+    # wo CBC mangels Subprozess-Support nicht aufrufbar ist.
+    class _ScipyHiGHSSolver(pl.LpSolver):
+        name = "SCIPY_HIGHS"
+
+        def available(self):
+            return True
+
+        def actualSolve(self, lp, **kwargs):
+            err, log = solve_prob(lp)
+            lp._scipy_log = log
+            if err is not None:
+                raise err
+            return lp.status
+
+    # PuLP importiert `LpSolverDefault` per `from .apis import ...` in mehrere
+    # Submodule. Damit `prob.solve()` ohne explizites Solver-Argument auf scipy
+    # routet, müssen alle Aliase auf unsere Instanz zeigen.
+    _scipy_default = _ScipyHiGHSSolver()
+    pl.LpSolverDefault = _scipy_default
+    pl.pulp.LpSolverDefault = _scipy_default
+    pl.apis.LpSolverDefault = _scipy_default
+    solver_ready = True  # marimo-Sentinel: erzwingt Reihenfolge `helpers → Demos`
 
     def check_solution(prob, expected_obj=None, label=""):
         """Solve a student-built PuLP problem and render a feedback panel.
@@ -57,7 +179,7 @@ def helpers(mo, pl):
         Robust gegen typische Anfängerfehler: keine Zielfunktion, keine
         Restriktionen, Solver-Exception, Infeasible/Unbounded. Wenn
         `expected_obj` angegeben ist, vergleicht es zusätzlich mit dem
-        erwarteten Zielfunktionswert. Der CBC-Solver-Output wird in einem
+        erwarteten Zielfunktionswert. Der Solver-Output wird in einem
         aufklappbaren Panel angezeigt.
         """
         head = f"### Auswertung — {label}" if label else "### Auswertung"
@@ -74,7 +196,7 @@ def helpers(mo, pl):
             return mo.md(f"{head}\n\n⚠️ **Keine Restriktionen** — "
                          "fügt `prob += <Ausdruck> <= <Wert>, \"Name\"` hinzu.")
 
-        err, log_text = _solve_with_log(prob)
+        err, log_text = solve_prob(prob)
         log_panel = _solver_log_panel(log_text)
 
         if err is not None:
@@ -140,7 +262,7 @@ def helpers(mo, pl):
             con_rows,
         ])
         return mo.vstack([mo.md(body), log_panel])
-    return (check_solution,)
+    return check_solution, solver_ready
 
 
 @app.cell(hide_code=True)
@@ -210,7 +332,7 @@ def _(mo):
 
 
 @app.cell
-def demo_city_ebike(mo, pl):
+def demo_city_ebike(mo, pl, solver_ready):
     ce_modell = pl.LpProblem("City_vs_EBike", pl.LpMaximize)
 
     ce_x_C = pl.LpVariable("x_C", lowBound=0)
@@ -221,7 +343,7 @@ def demo_city_ebike(mo, pl):
     ce_modell += ce_x_E <= 80, "Akku"
     ce_modell += ce_x_C <= 120, "Nachfrage_City"
 
-    ce_modell.solve(pl.PULP_CBC_CMD(msg=0))
+    ce_modell.solve()
 
     mo.md(f"""
     **Solverstatus:** `{pl.LpStatus[ce_modell.status]}`
@@ -288,7 +410,7 @@ def bp_data():
 
 
 @app.cell
-def bp_model(bp_kapa, bp_produkte, mo, pl):
+def bp_model(bp_kapa, bp_produkte, mo, pl, solver_ready):
     bp_modell = pl.LpProblem("BikeProd", pl.LpMaximize)
     bp_x = {p: pl.LpVariable(p, lowBound=0) for p in bp_produkte}
 
@@ -308,7 +430,7 @@ def bp_model(bp_kapa, bp_produkte, mo, pl):
         if bp_d["max"] is not None:
             bp_modell += bp_x[bp_p] <= bp_d["max"], f"Nachfrage_{bp_p}"
 
-    bp_modell.solve(pl.PULP_CBC_CMD(msg=0))
+    bp_modell.solve()
 
     bp_zeilen = "\n".join(f"| {p} | {bp_x[p].value():.2f} |" for p in bp_produkte)
     mo.md(f"""
@@ -377,7 +499,7 @@ def _(mo):
 
 
 @app.cell
-def sv_model(mo, pl):
+def sv_model(mo, pl, solver_ready):
     sv_prod = {
         "City":  {"kosten": 55, "montage": 2, "nachfrage": 90},
         "EBike": {"kosten": 95, "montage": 3, "nachfrage": 60},
@@ -399,7 +521,7 @@ def sv_model(mo, pl):
     for sv_p, sv_daten in sv_prod.items():
         sv_modell += sv_x[sv_p] + sv_short[sv_p] >= sv_servicequote * sv_daten["nachfrage"], f"Service_{sv_p}"
 
-    sv_modell.solve(pl.PULP_CBC_CMD(msg=0))
+    sv_modell.solve()
 
     sv_zeilen = "\n".join(
         f"| {p} | {sv_x[p].value():.2f} | {sv_short[p].value():.2f} | {sv_prod[p]['nachfrage']} |"
@@ -467,7 +589,7 @@ def sf_widget(mo):
 
 
 @app.cell
-def sf_solve(mo, pl, sf_fall):
+def sf_solve(mo, pl, sf_fall, solver_ready):
     sf_m = pl.LpProblem("Fall_" + sf_fall.value, pl.LpMaximize)
     sf_x = pl.LpVariable("x", lowBound=0)
     sf_y = pl.LpVariable("y", lowBound=0)
@@ -487,7 +609,7 @@ def sf_solve(mo, pl, sf_fall):
         sf_m += sf_x >= 0
         sf_kommentar = "Maximierung ohne Obergrenze → Zielfunktion → $\\infty$."
 
-    sf_m.solve(pl.PULP_CBC_CMD(msg=0))
+    sf_m.solve()
     mo.md(f"""
     **Solverstatus:** `{pl.LpStatus[sf_m.status]}`
 
@@ -587,7 +709,7 @@ def mb_musterloesung(mo):
     mb_modell += 3 * mb_x_S + 5 * mb_x_T <= 120, "Zeit"
     mb_modell += 2 * mb_x_S + 4 * mb_x_T <= 90,  "Holz"
 
-    mb_modell.solve(pl.PULP_CBC_CMD(msg=0))
+    mb_modell.solve()
     ```
 
     **Lösung:** $x_S = 15$, $x_T = 15$, $z = 1650$ €. Beide Restriktionen bindend.
@@ -686,7 +808,7 @@ def ms_musterloesung(mo):
     ms_modell += pl.lpSum(ms_x[k] for k in ms_komp) == 100, "Menge"
     ms_modell += ms_x["Nuesse"] <= 30, "Nussgrenze"
 
-    ms_modell.solve(pl.PULP_CBC_CMD(msg=0))
+    ms_modell.solve()
     ```
 
     **Lösung (gerundet):** $x_H \approx 74{,}3$ kg, $x_N \approx 11{,}2$ kg,
@@ -708,7 +830,7 @@ def ms_referenz(mo, ms_komp, pl):
     ms_ref += pl.lpSum(ms_komp[k]["fett"]    * ms_xref[k] for k in ms_komp) >= 12000, "Fett"
     ms_ref += pl.lpSum(ms_xref[k] for k in ms_komp) == 100, "Menge"
     ms_ref += ms_xref["Nuesse"] <= 30, "Nussgrenze"
-    ms_ref.solve(pl.PULP_CBC_CMD(msg=0))
+    ms_ref.solve()
 
     ms_ref_zeilen = "\n".join(f"| {k} | {ms_xref[k].value():.2f} |" for k in ms_komp)
     mo.md(f"""
@@ -824,7 +946,7 @@ def tp_musterloesung(mo):
     for j in tp_maerkte:
     tp_modell += pl.lpSum(tp_x[i, j] for i in tp_werke) >= tp_bedarf[j], f"Bedarf_{j}"
 
-    tp_modell.solve(pl.PULP_CBC_CMD(msg=0))
+    tp_modell.solve()
     ```
 
     **Lösung:** Werke arbeiten an der Kapazitätsgrenze
@@ -859,7 +981,7 @@ def tp_referenz(mo, pl, tp_bedarf, tp_kapa, tp_kosten, tp_maerkte, tp_werke):
     for j in tp_maerkte:
         tp_ref += pl.lpSum(tp_xref[i, j] for i in tp_werke) >= tp_bedarf[j], f"Bedarf_{j}"
 
-    tp_ref.solve(pl.PULP_CBC_CMD(msg=0))
+    tp_ref.solve()
 
     tp_header = "| | " + " | ".join(tp_maerkte) + " |"
     tp_sep    = "|---|" + "---|" * len(tp_maerkte)
@@ -972,7 +1094,7 @@ prob += pl.lpSum(kanal[k]["reach"] * b[k] for k in kanal)
 prob += pl.lpSum(b[k] for k in kanal) <= budget, "Budget"
 prob += b["Social"] >= 0.3 * budget, "Digital_Anteil"
 
-prob.solve(pl.PULP_CBC_CMD(msg=0))
+prob.solve()
 ```
 
 **Lösung:** TV = 50 000 €, Social = 40 000 € (max), Print = 5 000 € (min),
@@ -1152,7 +1274,7 @@ def _(mo):
     x = pl.LpVariable("x", lowBound=0)              # cat="Integer"/"Binary" optional
     m += 3 * x + 2 * y                              # Zielfunktion (kein <=, ==, >=)
     m += 2 * x + y <= 10, "Ressource_A"             # Constraint mit Namen
-    m.solve(pl.PULP_CBC_CMD(msg=0))                 # CBC ist Default-Solver
+    m.solve()                                       # nutzt LpSolverDefault
     print(pl.LpStatus[m.status], pl.value(m.objective), x.value())
     for name, c in m.constraints.items():
         print(name, c.slack, c.pi)                  # Slack + Schattenpreis
