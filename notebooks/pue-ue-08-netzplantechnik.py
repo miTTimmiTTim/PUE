@@ -18,8 +18,6 @@ __generated_with = "0.18.3"
 app = marimo.App(
     width="full",
     app_title="PuE Übung 8: Netzplantechnik",
-    layout_file="layouts/pue-ue-08-netzplantechnik.slides.json",
-    css_file="custom.css",
 )
 
 
