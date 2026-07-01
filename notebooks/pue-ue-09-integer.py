@@ -18,8 +18,6 @@ __generated_with = "0.18.3"
 app = marimo.App(
     width="full",
     app_title="PuE Übung 9: Integer Programming",
-    layout_file="layouts/pue-ue-09-integer.slides.json",
-    css_file="custom.css",
 )
 
 
